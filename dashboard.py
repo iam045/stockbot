@@ -1,173 +1,127 @@
 import streamlit as st
 import pandas as pd
+import yfinance as yf
 import requests
-from bs4 import BeautifulSoup
 import re
 import os
 from datetime import datetime, timedelta
 
-# --- 1. 系統設定與檔案路徑 ---
-st.set_page_config(page_title="處置監控中心", layout="wide", page_icon="⚖️")
-JAIL_FILE = "jail_list_v8.csv"
+# --- 1. 基礎設定 ---
+st.set_page_config(page_title="台股處置預警雷達", layout="wide", page_icon="⚡")
+JAIL_FILE = "jail_list.csv"
+DB_FILE = "attention_history.csv" # 儲存注意股歷史以計算計數器
 
-# --- 2. 核心：智慧爬蟲邏輯 ---
-def smart_scrape_ibf():
-    """
-    使用 BeautifulSoup 進行精準定位，而非僅用 pd.read_html
-    """
+# --- 2. 核心：智慧數據同步 ---
+def fetch_raw_disposal():
+    """從國票網站抓取原始處置清單，僅提取核心文字避免解析錯誤"""
     url = "https://www.ibfs.com.tw/stock3/measuringstock.aspx?xy=6&xt=1"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         response = requests.get(url, headers=headers, verify=False, timeout=10)
-        response.encoding = 'utf-8' # 確保中文不亂碼
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # 尋找包含「處置」關鍵字的表格
-        table = None
-        for t in soup.find_all('table'):
-            if "處置內容" in t.text:
-                table = t
-                break
-        
-        if table is None: return pd.DataFrame()
-
-        data = []
-        rows = table.find_all('tr')
-        for row in rows[1:]: # 跳過表頭
-            cols = row.find_all(['td', 'th'])
-            if len(cols) < 5: continue
-            
-            row_text = [c.text.strip() for c in cols]
-            
-            # 智慧提取資訊：利用正則表達式抓取括號內的代號
-            # 格式範例：新盛力 (4931) 
-            name_raw = row_text[1]
-            code_match = re.search(r'(\d{4,6})', row_text[2])
-            code = code_match.group(1) if code_match else "未知"
-            name = name_raw.split('(')[0].strip()
-            
-            # 撮合方式：提取數字 
-            match_mode = "".join(filter(str.isdigit, row_text[3]))
-            
-            # 內容解析出關時間 (結束日+1)
-            content = row_text[5] if len(row_text) > 5 else ""
-            release_date = parse_release_date_logic(content)
-            
-            data.append({
-                "股票名稱": name,
-                "代號": code,
-                "撮合方式": match_mode,
-                "出關時間": release_date,
-                "處置原因": row_text[4] # 處置條件 
-            })
-            
-        return pd.DataFrame(data)
-    except Exception as e:
-        st.error(f"智慧爬蟲啟動失敗: {e}")
+        dfs = pd.read_html(response.text)
+        return dfs[0] if dfs else pd.DataFrame()
+    except:
         return pd.DataFrame()
 
-def parse_release_date_logic(content):
-    """
-    實作規則：抓取「至114年12月31日」，回傳隔天
-    """
+def get_release_date(text):
+    """解析出關日期：抓取結束日並 +1 天 """
+    match = re.search(r'至(\d{3})年(\d{1,2})月(\d{1,2})日', str(text))
+    if match:
+        y = int(match.group(1)) + 1911
+        m = int(match.group(2))
+        d = int(match.group(3))
+        # 處置結束時間的隔天才算出關
+        return (datetime(y, m, d) + timedelta(days=1)).strftime("%Y-%m-%d")
+    return "-"
+
+# --- 3. 核心：預測模型運算 (依據白皮書) ---
+def calculate_quant_risk(code):
+    """計算白皮書中定義的量化風險 [cite: 7, 13]"""
     try:
-        match = re.search(r'至(\d{3})年(\d{1,2})月(\d{1,2})日', str(content))
-        if match:
-            year = int(match.group(1)) + 1911
-            month = int(match.group(2))
-            day = int(match.group(3))
-            end_date = datetime(year, month, day)
-            release_date = end_date + timedelta(days=1)
-            return release_date.strftime("%Y-%m-%d")
+        # 抓取最近 65 天數據以計算 60 日均量 [cite: 5]
+        ticker = yf.Ticker(f"{code}.TW")
+        df = ticker.history(period="65d")
+        if df.empty: return None
+
+        # 1. 漲幅過大監控 (32% 規則) 
+        ret_6d = (df.iloc[-1]['Close'] - df.iloc[-6]['Close']) / df.iloc[-6]['Close']
+        
+        # 2. 量能倍增監控 (5倍規則) [cite: 5, 7]
+        vol_6 = df.iloc[-6:]['Volume'].mean()
+        vol_60 = df.iloc[-60:]['Volume'].mean()
+        vol_x = vol_6 / vol_60 if vol_60 > 0 else 0
+        
+        return {"ret": ret_6d, "vol_x": vol_x, "price": df.iloc[-1]['Close']}
     except:
-        pass
-    return "需手動確認"
+        return None
 
-# --- 3. 資料庫存取與自動維護 ---
-def load_db():
-    if os.path.exists(JAIL_FILE):
-        return pd.read_csv(JAIL_FILE).astype(str)
-    return pd.DataFrame(columns=["股票名稱", "代號", "撮合方式", "出關時間", "處置原因"])
-
-def save_db(df):
-    # 自動剔除：過濾掉出關時間早於今天的標的
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    df = df[df["出關時間"] >= today_str]
-    df.drop_duplicates(subset=['代號'], keep='last').to_csv(JAIL_FILE, index=False, encoding='utf-8-sig')
-
-# --- 4. Streamlit 介面設計 ---
+# --- 4. 主介面 ---
 def main():
-    st.title("🛡️ 處置監控智慧雷達")
-    
-    # 初始化資料庫
-    if 'jail_db' not in st.session_state:
-        st.session_state.jail_db = load_db()
+    st.sidebar.title("戰情雷達導航")
+    menu = st.sidebar.radio("功能切換", ["📌 處置中", "🔮 預測雷達"])
 
-    # --- 功能選單 ---
-    tab1, tab2 = st.tabs(["📌 處置中標的", "⚙️ 資料庫管理"])
+    # --- 頁面 1: 處置中 (保留並優化) ---
+    if menu == "📌 處置中":
+        st.header("📌 處置中標的監控")
+        st.caption("自動同步國票清單，並依據結束日之次日計算出關時間")
 
-    with tab1:
-        st.header("處置中股票清單")
-        
-        # 快速統計資訊 [cite: 9]
-        db = st.session_state.jail_db
-        if not db.empty:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("總處置檔數", f"{len(db)} 檔")
-            c2.metric("20分鐘(Level 2)", f"{len(db[db['撮合方式'] == '20'])} 檔")
-            c3.metric("5分鐘(Level 1)", f"{len(db[db['撮合方式'] == '5'])} 檔")
-            
-            # 格式化合併名稱與代號顯示
-            db_display = db.copy()
-            db_display["股票名稱及代號"] = db_display["股票名稱"] + " (" + db_display["代號"] + ")"
-            
-            # 依照出關時間排序
-            db_display = db_display.sort_values(by="出關時間")
-            
-            st.dataframe(
-                db_display[["股票名稱及代號", "撮合方式", "出關時間", "處置原因"]],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "出關時間": st.column_config.TextColumn("🔓 出關日期 (結束日+1)"),
-                    "撮合方式": st.column_config.TextColumn("⏳ 撮合頻率 (分)")
-                }
-            )
+        if st.button("🔄 同步最新數據"):
+            raw_data = fetch_raw_disposal()
+            if not raw_data.empty:
+                processed = []
+                for _, row in raw_data.iterrows():
+                    # a. 股票名稱及代號
+                    name_code = f"{row.iloc[1]} ({row.iloc[2]})"
+                    # b. 撮合方式 (提取數字 5 或 20) 
+                    match_val = "".join(filter(str.isdigit, str(row.iloc[3])))
+                    # c. 出關時間 (結束日+1) 
+                    release = get_release_date(row.iloc[5])
+                    
+                    # 剔除已過期標的
+                    if release != "-" and release < datetime.now().strftime("%Y-%m-%d"):
+                        continue
+                        
+                    processed.append({
+                        "股票名稱及代號": name_code,
+                        "撮合方式": f"{match_val} 分鐘",
+                        "出關時間": release,
+                        "代號": str(row.iloc[2])
+                    })
+                
+                pd.DataFrame(processed).to_csv(JAIL_FILE, index=False)
+                st.success("同步完成並已自動剔除過期標的！")
+
+        if os.path.exists(JAIL_FILE):
+            df_jail = pd.read_csv(JAIL_FILE).sort_values(by="出關時間")
+            st.dataframe(df_jail[["股票名稱及代號", "撮合方式", "出關時間"]], use_container_width=True, hide_index=True)
         else:
-            st.info("資料庫目前為空，請至管理頁面同步資料。")
+            st.info("請先點擊同步按鈕。")
 
-    with tab2:
-        st.header("數據維護中心")
+    # --- 頁面 2: 預測雷達 (新功能建議) ---
+    elif menu == "🔮 預測雷達":
+        st.header("🔮 處置風險預測雷達")
+        st.info("依據白皮書量化規則，計算個股是否即將觸發「注意」或「處置」")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🔄 同步國票最新清單", type="primary"):
-                scraped_df = smart_scrape_ibf()
-                if not scraped_df.empty:
-                    # 融合現有資料與抓取資料
-                    new_db = pd.concat([st.session_state.jail_db, scraped_df]).drop_duplicates(subset=['代號'], keep='last')
-                    st.session_state.jail_db = new_db
-                    save_db(new_db)
-                    st.success("同步成功！系統已依據規則自動計算出關日與剔除過期標的。")
-                    st.rerun()
-                else:
-                    st.error("未能抓取到網頁資料，請檢查網路。")
-        
-        with col2:
-            if st.button("🗑️ 清空所有資料庫 (重置)"):
-                st.session_state.jail_db = pd.DataFrame(columns=["股票名稱", "代號", "撮合方式", "出關時間", "處置原因"])
-                if os.path.exists(JAIL_FILE): os.remove(JAIL_FILE)
-                st.rerun()
-
-        st.divider()
-        st.subheader("✍️ 手動快速校正")
-        st.write("如果自動抓取有誤，您可以直接編輯下表，編輯完後記得點擊下方存檔：")
-        edited_df = st.data_editor(st.session_state.jail_db, num_rows="dynamic", use_container_width=True)
-        
-        if st.button("💾 儲存手動修改"):
-            st.session_state.jail_db = edited_df
-            save_db(edited_df)
-            st.success("手動修改已存檔！")
+        input_codes = st.text_input("輸入欲追蹤的股票代號 (如: 4931, 3081)", "4931")
+        if st.button("啟動量化預測分析"):
+            codes = [c.strip() for c in input_codes.split(",")]
+            results = []
+            for c in codes:
+                risk = calculate_quant_risk(c)
+                if risk:
+                    # 判定邏輯 (白皮書規則：漲幅 > 32% 或 量能 > 5倍) [cite: 7]
+                    status = "✅ 安全"
+                    if risk['ret'] > 0.32: status = "🚨 漲幅過大"
+                    elif risk['vol_x'] > 5.0: status = "🔥 量能爆發"
+                    
+                    results.append({
+                        "代號": c,
+                        "當前價格": round(risk['price'], 2),
+                        "6日累積漲幅": f"{risk['ret']*100:.1f}%",
+                        "量能放大倍數": f"{risk['vol_x']:.1f}x",
+                        "預警狀態": status
+                    })
+            st.table(results)
 
 if __name__ == "__main__":
     main()
