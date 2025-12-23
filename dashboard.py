@@ -8,10 +8,10 @@ from datetime import datetime, timedelta
 # --- 1. 頁面基礎配置 ---
 st.set_page_config(page_title="處置監控中心", layout="wide", page_icon="⚖️")
 JAIL_FILE = "jail_list.csv"
-# 標準欄位定義
+# 標準化欄位，確保資料庫與程式邏輯對接
 REQUIRED_COLS = ["股票名稱及代號", "代號", "撮合方式", "出關時間", "處置原因"]
 
-# --- 2. 工具函式 ---
+# --- 2. 工具函式：日期與白話解讀 ---
 def get_weekday_cn(date_str):
     """將日期字串轉為帶有星期幾的格式 (週X)"""
     try:
@@ -22,11 +22,10 @@ def get_weekday_cn(date_str):
         return str(date_str)
 
 def convert_minguo_to_date(date_str):
-    """將民國格式轉為西元 datetime 並加 1 天"""
+    """將民國格式轉為西元並加 1 天 (出關日)"""
     try:
         clean_str = str(date_str).strip().replace(" ", "")
         y, m, d = map(int, clean_str.split('/'))
-        # 規則：處置結束時間的隔天才算出關
         return datetime(y + 1911, m, d) + timedelta(days=1)
     except:
         return None
@@ -38,22 +37,41 @@ def extract_match_mode(content):
         return "20"
     return "5"
 
+def translate_to_human(row):
+    """將專業術語轉為白話解讀標籤"""
+    reason = str(row.get('處置原因', ''))
+    mode = str(row.get('撮合方式', ''))
+    notes = []
+    
+    # 邏輯 1：當沖加長判定
+    if "沖銷" in reason:
+        notes.append("🚫當沖太熱(加關2天)")
+    
+    # 邏輯 2：重刑犯判定
+    if "20" in mode:
+        notes.append("💀重刑犯(需全額現款)")
+    
+    if not notes:
+        return "一般冷卻中"
+    
+    return " / ".join(notes)
+
 # --- 3. 官方 CSV 檔案處理引擎 ---
 def process_official_csv(uploaded_file):
-    """解析上市(TWSE)或上櫃(TPEx)的 CSV 內容，支援 Big5"""
+    """解析上市/上櫃 CSV，處理 Big5 編碼與標頭"""
     results = []
     today = datetime.now()
     try:
         raw_bytes = uploaded_file.read()
         try:
-            content = raw_bytes.decode('cp950') # 台灣官方 CSV 常用編碼
+            content = raw_bytes.decode('cp950') # 台灣官方檔案常用編碼
         except UnicodeDecodeError:
             content = raw_bytes.decode('utf-8-sig')
             
         lines = content.splitlines()
         if not lines: return []
 
-        # 判定來源
+        # 判定來源並設定欄位
         if "公布處置有價證券資訊" in lines[0]:
             df = pd.read_csv(io.StringIO("\n".join(lines[1:])))
             time_col, reason_col = '處置起迄時間', '處置條件'
@@ -97,11 +115,11 @@ def load_db():
     if os.path.exists(JAIL_FILE):
         try:
             df = pd.read_csv(JAIL_FILE, encoding='utf-8-sig').astype(str)
-            # 強制補齊欄位
+            # 強制修復缺失欄位，防止 KeyError
             for col in REQUIRED_COLS:
                 if col not in df.columns:
                     df[col] = ""
-            # 自動過期剔除
+            # 剔除已過期標的
             today_str = datetime.now().strftime("%Y-%m-%d")
             return df[df["出關時間"] > today_str]
         except:
@@ -110,20 +128,19 @@ def load_db():
 
 def save_db(df):
     if not df.empty:
-        # 存檔前過濾欄位
-        df = df[REQUIRED_COLS]
+        df = df[REQUIRED_COLS] # 確保欄位順序
         df.drop_duplicates(subset=['代號'], keep='last').to_csv(JAIL_FILE, index=False, encoding='utf-8-sig')
 
-# --- 5. 主程式介面 ---
+# --- 5. 主介面 ---
 def main():
     st.title("⚖️ 處置中標的監控")
     
     if 'jail_db' not in st.session_state:
         st.session_state.jail_db = load_db()
 
-    # --- A. 簡化上傳 UI ---
+    # --- A. 數據更新區塊 ---
     with st.expander("📥 數據更新 (上傳官方 CSV)"):
-        uploaded_files = st.file_uploader("選擇 punish.csv 或 disposal.csv", type="csv", accept_multiple_files=True, label_visibility="collapsed")
+        uploaded_files = st.file_uploader("請上傳 CSV 檔案", type="csv", accept_multiple_files=True, label_visibility="collapsed")
         if uploaded_files:
             if st.button("執行匯入", use_container_width=True):
                 all_new_data = []
@@ -135,60 +152,47 @@ def main():
                     combined = pd.concat([st.session_state.jail_db, new_df])
                     save_db(combined)
                     st.session_state.jail_db = load_db()
-                    st.success("已更新資料庫")
+                    st.success("匯入完成")
                     st.rerun()
 
     db = st.session_state.jail_db
     if not db.empty:
-        # 1. 預先處理顯示資料
+        # 準備顯示用的 DataFrame，預先建立所有必要欄位以防 KeyError
         db_display = db.copy()
-        db_display["出關日期"] = db_display["出關時間"].apply(get_weekday_cn)
-        # 處理原因標籤
-        def add_tags(row):
-            reason = str(row['處置原因'])
-            mode = str(row['撮合方式'])
-            tags = []
-            if "沖銷" in reason: tags.append("⚠️當沖加長")
-            if "20" in mode: tags.append("🔴累犯/加重")
-            return f"{reason} {' '.join(tags)}".strip()
-        
-        db_display["備註/原因"] = db_display.apply(add_tags, axis=1)
+        db_display["🔓 出關日期"] = db_display["出關時間"].apply(get_weekday_cn)
+        db_display["🚨 白話解讀"] = db_display.apply(translate_to_human, axis=1)
         db_sorted = db_display.sort_values(by="出關時間")
 
-        # --- B. 左右分欄顯示 (純表格，無卡片) ---
+        # --- B. 左右分欄 (獨立顯示 5min / 20min) ---
         st.markdown("---")
-        col_5, col_20 = st.columns(2)
+        col_left, col_right = st.columns(2)
         
-        with col_5:
-            st.markdown("### ⏳ 5分鐘處置")
+        with col_left:
+            st.subheader("⏳ 5分鐘撮合")
             df_5 = db_sorted[db_sorted['撮合方式'].str.contains('5')]
             if not df_5.empty:
-                st.dataframe(df_5[["股票名稱及代號", "出關日期", "備註/原因"]], hide_index=True, use_container_width=True)
+                st.dataframe(df_5[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
             else:
-                st.write("目前無 5 分鐘處置標的")
+                st.write("目前無標的")
 
-        with col_20:
-            st.markdown("### 🚨 20分鐘處置")
+        with col_right:
+            st.subheader("🚨 20分鐘撮合")
             df_20 = db_sorted[db_sorted['撮合方式'].str.contains('20')]
             if not df_20.empty:
-                st.dataframe(df_20[["股票名稱及代號", "出關日期", "備註/原因"]], hide_index=True, use_container_width=True)
+                st.dataframe(df_20[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
             else:
-                st.write("目前無 20 分鐘處置標的")
+                st.write("目前無標的")
 
-        # --- C. 原本的大 Data 表格 ---
+        # --- C. 完整 Data 展示 ---
         st.markdown("---")
-        st.markdown("### 📋 完整處置清單")
-        # 確保顯示欄位都存在
+        st.subheader("📋 完整監控清單")
         st.dataframe(
-            db_sorted[["股票名稱及代號", "撮合方式", "出關日期", "處置原因"]],
+            db_sorted[["股票名稱及代號", "撮合方式", "🔓 出關日期", "處置原因"]],
             use_container_width=True,
-            hide_index=True,
-            column_config={
-                "出關日期": st.column_config.TextColumn("🔓 出關時間 (結束日+1)")
-            }
+            hide_index=True
         )
     else:
-        st.info("資料庫清單目前為空。")
+        st.info("資料庫目前為空。請展開「數據更新」進行匯入。")
 
     with st.sidebar:
         st.subheader("⚙️ 系統管理")
