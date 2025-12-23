@@ -6,7 +6,7 @@ import io
 from datetime import datetime, timedelta
 
 # --- 1. 頁面基礎配置 ---
-st.set_page_config(page_title="處置監控中心", layout="wide", page_icon="⚖️")
+st.set_page_config(page_title="處置監控系統", layout="wide", page_icon="⚖️")
 JAIL_FILE = "jail_list.csv"
 REQUIRED_COLS = ["股票名稱及代號", "代號", "撮合方式", "出關時間"]
 
@@ -37,9 +37,9 @@ def process_official_csv(uploaded_file):
     try:
         raw_bytes = uploaded_file.read()
         try:
-            content = raw_bytes.decode('cp950') # 支援 Big5
+            content = raw_bytes.decode('cp950') # 支援官方 Big5 編碼
         except UnicodeDecodeError:
-            content = raw_bytes.decode('utf-8-sig') # 支援 UTF-8
+            content = raw_bytes.decode('utf-8-sig')
             
         lines = content.splitlines()
         if not lines: return []
@@ -94,7 +94,7 @@ def load_db():
             df = pd.read_csv(JAIL_FILE, encoding='utf-8-sig').astype(str)
             if not all(col in df.columns for col in REQUIRED_COLS):
                 return pd.DataFrame(columns=REQUIRED_COLS)
-            # 自動剔除已出關標的
+            # 自動剔除已過出關標的
             today_str = datetime.now().strftime("%Y-%m-%d")
             return df[df["出關時間"] > today_str]
         except:
@@ -113,7 +113,7 @@ def main():
     if 'jail_db' not in st.session_state:
         st.session_state.jail_db = load_db()
 
-    # --- A. 簡化上傳 UI (收納在 Expander) ---
+    # --- A. 簡化上傳區塊 ---
     with st.expander("📥 數據更新 (上傳官方 CSV)"):
         uploaded_files = st.file_uploader("請選擇 punish.csv 或 disposal.csv", type="csv", accept_multiple_files=True, label_visibility="collapsed")
         if uploaded_files:
@@ -130,34 +130,63 @@ def main():
                     st.success(f"已匯入 {len(all_new_data)} 筆資料")
                     st.rerun()
 
-    # --- B. 主監控列表 ---
     db = st.session_state.jail_db
+    
     if not db.empty:
-        # 頂部快訊
-        c1, c2, c3 = st.columns([1, 1, 2])
-        c1.metric("總處置檔數", f"{len(db)} 檔")
-        c2.metric("20分鐘(L2)", f"{len(db[db['撮合方式'].str.contains('20')])} 檔")
-        c3.caption(f"🕒 更新時間：{datetime.now().strftime('%m/%d %H:%M')}")
+        # 排序資料，供後續使用
+        db_sorted = db.sort_values(by="出關時間")
 
+        # --- B. 左右獨立小看板 (5分鐘 vs 20分鐘) ---
+        st.markdown("### 📊 分級監控速報")
+        col_5min, col_20min = st.columns(2)
+        
+        # 5分鐘處置區塊 (Level 1)
+        with col_5min:
+            df_5 = db_sorted[db_sorted['撮合方式'].str.contains('5')]
+            st.error(f"⏳ **5分鐘撮合 ({len(df_5)} 檔)**")
+            if not df_5.empty:
+                st.dataframe(
+                    df_5[["股票名稱及代號", "出關時間"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={"出關時間": "🔓 出關"}
+                )
+            else:
+                st.write("目前無標的")
+
+        # 20分鐘處置區塊 (Level 2)
+        with col_20min:
+            df_20 = db_sorted[db_sorted['撮合方式'].str.contains('20')]
+            st.warning(f"🚨 **20分鐘撮合 ({len(df_20)} 檔)**")
+            if not df_20.empty:
+                st.dataframe(
+                    df_20[["股票名稱及代號", "出關時間"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={"出關時間": "🔓 出關"}
+                )
+            else:
+                st.write("目前無標的")
+
+        # --- C. 完整 Data 展示 ---
         st.markdown("---")
-        # 排序並顯示
-        df_display = db.sort_values(by="出關時間")
+        st.markdown("### 📋 完整詳細清單")
         st.dataframe(
-            df_display[["股票名稱及代號", "撮合方式", "出關時間"]],
+            db_sorted[["股票名稱及代號", "撮合方式", "出關時間"]],
             use_container_width=True,
             hide_index=True,
             column_config={
                 "股票名稱及代號": st.column_config.TextColumn("證券標的"),
-                "撮合方式": st.column_config.TextColumn("⏳ 撮合"),
-                "出關時間": st.column_config.TextColumn("🔓 出關 (結束日+1)")
+                "撮合方式": st.column_config.TextColumn("撮合頻率"),
+                "出關時間": st.column_config.TextColumn("🔓 出關時間 (結束日+1)")
             }
         )
     else:
         st.info("目前資料庫為空。請展開上方「數據更新」進行檔案匯入。")
 
-    # --- C. 功能區域 (重置) ---
+    # --- 系統管理 (側邊欄) ---
     with st.sidebar:
-        st.subheader("系統管理")
+        st.subheader("⚙️ 系統管理")
         if st.button("🗑️ 清空資料庫"):
             if os.path.exists(JAIL_FILE): os.remove(JAIL_FILE)
             st.session_state.jail_db = pd.DataFrame(columns=REQUIRED_COLS)
