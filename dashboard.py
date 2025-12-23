@@ -1,27 +1,25 @@
 import streamlit as st
 import pandas as pd
 import os
-import re
 import io
 from datetime import datetime, timedelta
 
 # --- 1. 頁面基礎配置 ---
 st.set_page_config(page_title="處置監控中心", layout="wide", page_icon="⚖️")
 JAIL_FILE = "jail_list.csv"
+# 標準化欄位：必須包含「處置起日」
 REQUIRED_COLS = ["股票名稱及代號", "代號", "撮合方式", "處置起日", "出關時間", "處置原因"]
 
 # --- 2. 工具函式 ---
 def get_logical_today():
-    """
-    凌晨緩衝邏輯：若現在是凌晨 0-6 點，邏輯上仍視為前一天
-    """
+    """凌晨 6 點前視為前一交易日，解決凌晨作業的顯示直覺問題"""
     now = datetime.now()
     if now.hour < 6:
         return (now - timedelta(days=1)).strftime("%Y-%m-%d")
     return now.strftime("%Y-%m-%d")
 
-def get_weekday_cn(date_str):
-    """將日期字串轉為極簡格式：12/24(三)"""
+def get_simple_date(date_str):
+    """格式化為 12/24(三)"""
     try:
         dt = datetime.strptime(str(date_str), "%Y-%m-%d")
         weekdays = ["一", "二", "三", "四", "五", "六", "日"]
@@ -30,31 +28,27 @@ def get_weekday_cn(date_str):
         return str(date_str)
 
 def parse_period(period_str):
-    """拆解處置期間，回傳 (起日, 出關日)"""
+    """將官方 114/12/24~115/01/08 拆解為西元 (起日, 出關日)"""
     try:
         clean_str = str(period_str).strip().replace(" ", "")
-        # 處理 114/12/24~115/01/08 或 114/12/24-115/01/08
         sep = '~' if '~' in clean_str else '-'
-        start_str, end_str = clean_str.split(sep)
+        s_part, e_part = clean_str.split(sep)
         
-        def minguo_to_iso(s):
+        def m_to_iso(s):
             y, m, d = map(int, s.split('/'))
             return datetime(y + 1911, m, d)
         
-        start_date = minguo_to_iso(start_str)
-        end_date = minguo_to_iso(end_str)
-        release_date = end_date + timedelta(days=1)
-        return start_date.strftime("%Y-%m-%d"), release_date.strftime("%Y-%m-%d")
+        start_dt = m_to_iso(s_part)
+        release_dt = m_to_iso(e_part) + timedelta(days=1)
+        return start_dt.strftime("%Y-%m-%d"), release_dt.strftime("%Y-%m-%d")
     except:
         return None, None
 
 def extract_match_mode(content):
-    """從處置內容提取撮合分鐘"""
-    content = str(content)
-    return "20" if "20" in content or "二十分鐘" in content else "5"
+    return "20" if "20" in str(content) or "二十分鐘" in str(content) else "5"
 
 def translate_to_human(row):
-    """白話解讀標籤"""
+    """白話標籤"""
     reason = str(row.get('處置原因', ''))
     mode = str(row.get('撮合方式', ''))
     notes = []
@@ -70,7 +64,6 @@ def process_official_csv(uploaded_file):
         raw_bytes = uploaded_file.read()
         try: content = raw_bytes.decode('cp950')
         except: content = raw_bytes.decode('utf-8-sig')
-            
         lines = content.splitlines()
         if not lines: return []
 
@@ -86,27 +79,18 @@ def process_official_csv(uploaded_file):
             reason_col = next((c for c in df.columns if '原因' in c or '條件' in c), None)
 
         for _, row in df.iterrows():
-            try:
-                name = str(row.get('證券名稱', '未知')).strip()
-                code = str(row.get('證券代號', '')).split('.')[0].strip()
-                measure_content = str(row.get('處置內容', ''))
-                reason = str(row.get(reason_col, '')) if reason_col else ""
-                period = str(row.get(time_col, ''))
-                
-                start_dt, release_dt = parse_period(period)
-                if not code or not release_dt: continue
-
-                # 只要尚未出關（依照邏輯今天判定）都存入
-                if release_dt > logical_today:
-                    results.append({
-                        "股票名稱及代號": f"{name} ({code})",
-                        "代號": str(code),
-                        "撮合方式": f"{extract_match_mode(measure_content)} 分鐘",
-                        "處置起日": start_dt,
-                        "出關時間": release_dt,
-                        "處置原因": reason
-                    })
-            except: continue
+            s_dt, r_dt = parse_period(row.get(time_col, ''))
+            code = str(row.get('證券代號', '')).split('.')[0].strip()
+            if not code or not r_dt: continue
+            if r_dt > logical_today:
+                results.append({
+                    "股票名稱及代號": f"{str(row.get('證券名稱','未知'))} ({code})",
+                    "代號": code,
+                    "撮合方式": f"{extract_match_mode(row.get('處置內容',''))} 分鐘",
+                    "處置起日": s_dt,
+                    "出關時間": r_dt,
+                    "處置原因": str(row.get(reason_col, ''))
+                })
     except Exception as e:
         st.error(f"解析失敗：{e}")
     return results
@@ -117,9 +101,11 @@ def load_db():
     if os.path.exists(JAIL_FILE):
         try:
             df = pd.read_csv(JAIL_FILE, encoding='utf-8-sig').astype(str)
+            # 自動修復 KeyError：補齊缺失欄位
             for col in REQUIRED_COLS:
-                if col not in df.columns: df[col] = ""
-            # 自動過濾已出關標的
+                if col not in df.columns:
+                    # 若缺「處置起日」，預設為遠古日期使其不進入「明日」區塊
+                    df[col] = "1900-01-01" if col == "處置起日" else ""
             return df[df["出關時間"] > logical_today]
         except: return pd.DataFrame(columns=REQUIRED_COLS)
     return pd.DataFrame(columns=REQUIRED_COLS)
@@ -129,9 +115,10 @@ def save_db(df):
         df = df[REQUIRED_COLS]
         df.drop_duplicates(subset=['代號'], keep='last').to_csv(JAIL_FILE, index=False, encoding='utf-8-sig')
 
-# --- 5. 主程式 ---
+# --- 5. 主介面 ---
 def main():
     st.title("⚖️ 處置中標的監控")
+    logical_today = get_logical_today()
     
     if 'jail_db' not in st.session_state:
         st.session_state.jail_db = load_db()
@@ -145,25 +132,23 @@ def main():
                     f.seek(0)
                     all_data.extend(process_official_csv(f))
                 if all_data:
-                    new_upload_df = pd.DataFrame(all_data)
-                    combined = pd.concat([st.session_state.jail_db, new_upload_df])
+                    new_df = pd.DataFrame(all_data)
+                    combined = pd.concat([st.session_state.jail_db, new_df])
                     save_db(combined)
                     st.session_state.jail_db = load_db()
-                    st.success("資料庫已同步更新")
+                    st.success("資料庫同步更新完成")
                     st.rerun()
 
     db = st.session_state.jail_db
     if not db.empty:
-        logical_today = get_logical_today()
-        
-        # 顯示資料預處理
+        # 顯示資料處理
         db_display = db.copy()
-        db_display["🔓 出關日期"] = db_display["出關時間"].apply(get_weekday_cn)
+        db_display["🔓 出關日期"] = db_display["出關時間"].apply(get_simple_date)
         db_display["🚨 白話解讀"] = db_display.apply(translate_to_human, axis=1)
         db_sorted = db_display.sort_values(by="出關時間")
 
-        # --- A. 明日/新進處置 (起日 >= 邏輯今天) ---
-        # 解決凌晨問題：若起日是 12/24，在凌晨 0-6 點看仍會在這
+        # --- A. 明日進處置 (起日 > 邏輯今天) ---
+        # 4931 新盛力 (12/24 起) 在 12/24 凌晨 01:34 看 (邏輯今天=12/23) 會正確出現在這
         df_new = db_sorted[db_sorted["處置起日"] > logical_today]
         
         st.markdown("---")
@@ -176,22 +161,20 @@ def main():
                 st.write("目前無新入選標的")
         with col_new_r: st.write("")
 
-        # --- B. 5分鐘 vs 20分鐘看板 (起日 <= 邏輯今天) ---
+        # --- B. 正在處置中看板 (起日 <= 邏輯今天) ---
         st.markdown("---")
         df_current = db_sorted[db_sorted["處置起日"] <= logical_today]
         col_5, col_20 = st.columns(2)
-        
         with col_5:
             st.subheader("⏳ 5分鐘撮合")
             df_5 = df_current[df_current['撮合方式'].str.contains('5')]
             st.dataframe(df_5[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
-
         with col_20:
             st.subheader("🚨 20分鐘撮合")
             df_20 = df_current[df_current['撮合方式'].str.contains('20')]
             st.dataframe(df_20[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
 
-        # --- C. 完整詳細清單 ---
+        # --- C. 完整清單 ---
         st.markdown("---")
         st.subheader("📋 完整監控清單")
         st.dataframe(db_sorted[["股票名稱及代號", "撮合方式", "🔓 出關日期", "處置原因"]], use_container_width=True, hide_index=True)
@@ -200,7 +183,7 @@ def main():
 
     with st.sidebar:
         st.subheader("⚙️ 系統管理")
-        st.caption(f"邏輯今天：{get_logical_today()}")
+        st.caption(f"邏輯今天：{logical_today}")
         if st.button("🗑️ 清空資料庫"):
             if os.path.exists(JAIL_FILE): os.remove(JAIL_FILE)
             st.session_state.jail_db = pd.DataFrame(columns=REQUIRED_COLS)
