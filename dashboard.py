@@ -7,12 +7,11 @@ from datetime import datetime, timedelta
 # --- 1. 頁面基礎配置 ---
 st.set_page_config(page_title="處置監控中心", layout="wide", page_icon="⚖️")
 JAIL_FILE = "jail_list.csv"
-# 標準化欄位：必須包含「處置起日」
 REQUIRED_COLS = ["股票名稱及代號", "代號", "撮合方式", "處置起日", "出關時間", "處置原因"]
 
 # --- 2. 工具函式 ---
 def get_logical_today():
-    """凌晨 6 點前視為前一交易日，解決凌晨作業的顯示直覺問題"""
+    """凌晨 6 點前視為前一交易日"""
     now = datetime.now()
     if now.hour < 6:
         return (now - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -28,16 +27,14 @@ def get_simple_date(date_str):
         return str(date_str)
 
 def parse_period(period_str):
-    """將官方 114/12/24~115/01/08 拆解為西元 (起日, 出關日)"""
+    """解析民國期間為西元日期"""
     try:
         clean_str = str(period_str).strip().replace(" ", "")
         sep = '~' if '~' in clean_str else '-'
         s_part, e_part = clean_str.split(sep)
-        
         def m_to_iso(s):
             y, m, d = map(int, s.split('/'))
             return datetime(y + 1911, m, d)
-        
         start_dt = m_to_iso(s_part)
         release_dt = m_to_iso(e_part) + timedelta(days=1)
         return start_dt.strftime("%Y-%m-%d"), release_dt.strftime("%Y-%m-%d")
@@ -48,7 +45,7 @@ def extract_match_mode(content):
     return "20" if "20" in str(content) or "二十分鐘" in str(content) else "5"
 
 def translate_to_human(row):
-    """白話標籤"""
+    """白話解讀標籤"""
     reason = str(row.get('處置原因', ''))
     mode = str(row.get('撮合方式', ''))
     notes = []
@@ -101,10 +98,8 @@ def load_db():
     if os.path.exists(JAIL_FILE):
         try:
             df = pd.read_csv(JAIL_FILE, encoding='utf-8-sig').astype(str)
-            # 自動修復 KeyError：補齊缺失欄位
             for col in REQUIRED_COLS:
                 if col not in df.columns:
-                    # 若缺「處置起日」，預設為遠古日期使其不進入「明日」區塊
                     df[col] = "1900-01-01" if col == "處置起日" else ""
             return df[df["出關時間"] > logical_today]
         except: return pd.DataFrame(columns=REQUIRED_COLS)
@@ -148,7 +143,6 @@ def main():
         db_sorted = db_display.sort_values(by="出關時間")
 
         # --- A. 明日進處置 (起日 > 邏輯今天) ---
-        # 4931 新盛力 (12/24 起) 在 12/24 凌晨 01:34 看 (邏輯今天=12/23) 會正確出現在這
         df_new = db_sorted[db_sorted["處置起日"] > logical_today]
         
         st.markdown("---")
@@ -161,18 +155,27 @@ def main():
                 st.write("目前無新入選標的")
         with col_new_r: st.write("")
 
-        # --- B. 正在處置中看板 (起日 <= 邏輯今天) ---
+        # --- B. 5分鐘 vs 20分鐘看板 (顯示該類別的所有標的，不論起日) ---
+        # 修正點：不再從 df_current 過濾，而是從 db_sorted 全域過濾
         st.markdown("---")
-        df_current = db_sorted[db_sorted["處置起日"] <= logical_today]
         col_5, col_20 = st.columns(2)
         with col_5:
             st.subheader("⏳ 5分鐘撮合")
-            df_5 = df_current[df_current['撮合方式'].str.contains('5')]
-            st.dataframe(df_5[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
+            # 顯示所有 5 分鐘標的
+            df_5_all = db_sorted[db_sorted['撮合方式'].str.contains('5')]
+            if not df_5_all.empty:
+                st.dataframe(df_5_all[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
+            else:
+                st.write("目前無 5 分鐘標的")
+
         with col_20:
             st.subheader("🚨 20分鐘撮合")
-            df_20 = df_current[df_current['撮合方式'].str.contains('20')]
-            st.dataframe(df_20[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
+            # 顯示所有 20 分鐘標的，包含新盛力
+            df_20_all = db_sorted[db_sorted['撮合方式'].str.contains('20')]
+            if not df_20_all.empty:
+                st.dataframe(df_20_all[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
+            else:
+                st.write("目前無 20 分鐘標的")
 
         # --- C. 完整清單 ---
         st.markdown("---")
