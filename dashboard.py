@@ -8,9 +8,18 @@ from datetime import datetime, timedelta
 # --- 1. 頁面基礎配置 ---
 st.set_page_config(page_title="處置監控中心", layout="wide", page_icon="⚖️")
 JAIL_FILE = "jail_list.csv"
-REQUIRED_COLS = ["股票名稱及代號", "代號", "撮合方式", "出關時間", "處置原因"]
+REQUIRED_COLS = ["股票名稱及代號", "代號", "撮合方式", "處置起日", "出關時間", "處置原因"]
 
 # --- 2. 工具函式 ---
+def get_logical_today():
+    """
+    凌晨緩衝邏輯：若現在是凌晨 0-6 點，邏輯上仍視為前一天
+    """
+    now = datetime.now()
+    if now.hour < 6:
+        return (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    return now.strftime("%Y-%m-%d")
+
 def get_weekday_cn(date_str):
     """將日期字串轉為極簡格式：12/24(三)"""
     try:
@@ -20,44 +29,47 @@ def get_weekday_cn(date_str):
     except:
         return str(date_str)
 
-def convert_minguo_to_date(date_str):
-    """將民國格式轉為西元並加 1 天 (出關日)"""
+def parse_period(period_str):
+    """拆解處置期間，回傳 (起日, 出關日)"""
     try:
-        clean_str = str(date_str).strip().replace(" ", "")
-        y, m, d = map(int, clean_str.split('/'))
-        return datetime(y + 1911, m, d) + timedelta(days=1)
+        clean_str = str(period_str).strip().replace(" ", "")
+        # 處理 114/12/24~115/01/08 或 114/12/24-115/01/08
+        sep = '~' if '~' in clean_str else '-'
+        start_str, end_str = clean_str.split(sep)
+        
+        def minguo_to_iso(s):
+            y, m, d = map(int, s.split('/'))
+            return datetime(y + 1911, m, d)
+        
+        start_date = minguo_to_iso(start_str)
+        end_date = minguo_to_iso(end_str)
+        release_date = end_date + timedelta(days=1)
+        return start_date.strftime("%Y-%m-%d"), release_date.strftime("%Y-%m-%d")
     except:
-        return None
+        return None, None
 
 def extract_match_mode(content):
-    """從處置內容提取撮合分鐘 (5 或 20)"""
+    """從處置內容提取撮合分鐘"""
     content = str(content)
-    if "20" in content or "二十分鐘" in content:
-        return "20"
-    return "5"
+    return "20" if "20" in content or "二十分鐘" in content else "5"
 
 def translate_to_human(row):
-    """將專業術語轉為白話解讀標籤"""
+    """白話解讀標籤"""
     reason = str(row.get('處置原因', ''))
     mode = str(row.get('撮合方式', ''))
     notes = []
-    if "沖銷" in reason:
-        notes.append("🚫當沖加關")
-    if "20" in mode:
-        notes.append("💀重刑犯(預收)")
+    if "沖銷" in reason: notes.append("🚫當沖加關")
+    if "20" in mode: notes.append("💀重刑犯(預收)")
     return " / ".join(notes) if notes else "一般冷卻"
 
-# --- 3. 官方 CSV 檔案處理引擎 ---
+# --- 3. 檔案處理 ---
 def process_official_csv(uploaded_file):
-    """解析官方 CSV (上市 punish.csv / 上櫃 disposal)"""
     results = []
-    today = datetime.now()
+    logical_today = get_logical_today()
     try:
         raw_bytes = uploaded_file.read()
-        try:
-            content = raw_bytes.decode('cp950') # 繁體常用編碼
-        except UnicodeDecodeError:
-            content = raw_bytes.decode('utf-8-sig')
+        try: content = raw_bytes.decode('cp950')
+        except: content = raw_bytes.decode('utf-8-sig')
             
         lines = content.splitlines()
         if not lines: return []
@@ -80,15 +92,18 @@ def process_official_csv(uploaded_file):
                 measure_content = str(row.get('處置內容', ''))
                 reason = str(row.get(reason_col, '')) if reason_col else ""
                 period = str(row.get(time_col, ''))
-                if not code or '~' not in period: continue
-                end_date_part = period.split('~')[1]
-                release_obj = convert_minguo_to_date(end_date_part)
-                if release_obj and release_obj > today:
+                
+                start_dt, release_dt = parse_period(period)
+                if not code or not release_dt: continue
+
+                # 只要尚未出關（依照邏輯今天判定）都存入
+                if release_dt > logical_today:
                     results.append({
                         "股票名稱及代號": f"{name} ({code})",
                         "代號": str(code),
                         "撮合方式": f"{extract_match_mode(measure_content)} 分鐘",
-                        "出關時間": release_obj.strftime("%Y-%m-%d"),
+                        "處置起日": start_dt,
+                        "出關時間": release_dt,
                         "處置原因": reason
                     })
             except: continue
@@ -98,15 +113,15 @@ def process_official_csv(uploaded_file):
 
 # --- 4. 資料庫維護 ---
 def load_db():
+    logical_today = get_logical_today()
     if os.path.exists(JAIL_FILE):
         try:
             df = pd.read_csv(JAIL_FILE, encoding='utf-8-sig').astype(str)
             for col in REQUIRED_COLS:
                 if col not in df.columns: df[col] = ""
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            return df[df["出關時間"] > today_str]
-        except:
-            return pd.DataFrame(columns=REQUIRED_COLS)
+            # 自動過濾已出關標的
+            return df[df["出關時間"] > logical_today]
+        except: return pd.DataFrame(columns=REQUIRED_COLS)
     return pd.DataFrame(columns=REQUIRED_COLS)
 
 def save_db(df):
@@ -114,80 +129,69 @@ def save_db(df):
         df = df[REQUIRED_COLS]
         df.drop_duplicates(subset=['代號'], keep='last').to_csv(JAIL_FILE, index=False, encoding='utf-8-sig')
 
-# --- 5. 主程式介面 ---
+# --- 5. 主程式 ---
 def main():
     st.title("⚖️ 處置中標的監控")
     
     if 'jail_db' not in st.session_state:
         st.session_state.jail_db = load_db()
-    
-    if 'new_stocks' not in st.session_state:
-        st.session_state.new_stocks = pd.DataFrame(columns=REQUIRED_COLS)
 
-    # --- A. 數據更新區塊 ---
     with st.expander("📥 數據更新 (上傳官方 CSV)"):
         uploaded_files = st.file_uploader("上傳 CSV", type="csv", accept_multiple_files=True, label_visibility="collapsed")
         if uploaded_files:
             if st.button("執行匯入", use_container_width=True):
-                all_new_data_list = []
+                all_data = []
                 for f in uploaded_files:
                     f.seek(0)
-                    all_new_data_list.extend(process_official_csv(f))
-                
-                if all_new_data_list:
-                    new_upload_df = pd.DataFrame(all_new_data_list)
-                    
-                    # 邏輯：比對找出「新入選」的標的
-                    existing_codes = set(st.session_state.jail_db['代號'].tolist())
-                    new_entries = new_upload_df[~new_upload_df['代號'].isin(existing_codes)]
-                    st.session_state.new_stocks = new_entries
-                    
-                    # 更新總資料庫
+                    all_data.extend(process_official_csv(f))
+                if all_data:
+                    new_upload_df = pd.DataFrame(all_data)
                     combined = pd.concat([st.session_state.jail_db, new_upload_df])
                     save_db(combined)
                     st.session_state.jail_db = load_db()
-                    st.success(f"更新成功！偵測到 {len(new_entries)} 筆新進處置標的。")
+                    st.success("資料庫已同步更新")
                     st.rerun()
 
     db = st.session_state.jail_db
     if not db.empty:
-        # 預處理顯示欄位
-        def prepare_display(df):
-            if df.empty: return df
-            d = df.copy()
-            d["🔓 出關日期"] = d["出關時間"].apply(get_weekday_cn)
-            d["🚨 白話解讀"] = d.apply(translate_to_human, axis=1)
-            return d.sort_values(by="出關時間")
+        logical_today = get_logical_today()
+        
+        # 顯示資料預處理
+        db_display = db.copy()
+        db_display["🔓 出關日期"] = db_display["出關時間"].apply(get_weekday_cn)
+        db_display["🚨 白話解讀"] = db_display.apply(translate_to_human, axis=1)
+        db_sorted = db_display.sort_values(by="出關時間")
 
-        db_sorted = prepare_display(db)
-        new_sorted = prepare_display(st.session_state.new_stocks)
-
-        # --- B. 新增：明日進處置區塊 ---
+        # --- A. 明日/新進處置 (起日 >= 邏輯今天) ---
+        # 解決凌晨問題：若起日是 12/24，在凌晨 0-6 點看仍會在這
+        df_new = db_sorted[db_sorted["處置起日"] > logical_today]
+        
         st.markdown("---")
         col_new_l, col_new_r = st.columns(2)
         with col_new_l:
             st.markdown("### 🆕 明日進處置")
-            if not new_sorted.empty:
-                st.dataframe(new_sorted[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
+            if not df_new.empty:
+                st.dataframe(df_new[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
             else:
                 st.write("目前無新入選標的")
-        with col_new_r:
-            st.write("") # 右邊留空
+        with col_new_r: st.write("")
 
-        # --- C. 5分鐘 vs 20分鐘看板 ---
+        # --- B. 5分鐘 vs 20分鐘看板 (起日 <= 邏輯今天) ---
         st.markdown("---")
+        df_current = db_sorted[db_sorted["處置起日"] <= logical_today]
         col_5, col_20 = st.columns(2)
+        
         with col_5:
             st.subheader("⏳ 5分鐘撮合")
-            df_5 = db_sorted[db_sorted['撮合方式'].str.contains('5')]
+            df_5 = df_current[df_current['撮合方式'].str.contains('5')]
             st.dataframe(df_5[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
 
         with col_20:
             st.subheader("🚨 20分鐘撮合")
-            df_20 = db_sorted[db_sorted['撮合方式'].str.contains('20')]
+            df_20 = df_current[df_current['撮合方式'].str.contains('20')]
             st.dataframe(df_20[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
 
-        # --- D. 完整詳細清單 ---
+        # --- C. 完整詳細清單 ---
         st.markdown("---")
         st.subheader("📋 完整監控清單")
         st.dataframe(db_sorted[["股票名稱及代號", "撮合方式", "🔓 出關日期", "處置原因"]], use_container_width=True, hide_index=True)
@@ -196,10 +200,10 @@ def main():
 
     with st.sidebar:
         st.subheader("⚙️ 系統管理")
+        st.caption(f"邏輯今天：{get_logical_today()}")
         if st.button("🗑️ 清空資料庫"):
             if os.path.exists(JAIL_FILE): os.remove(JAIL_FILE)
             st.session_state.jail_db = pd.DataFrame(columns=REQUIRED_COLS)
-            st.session_state.new_stocks = pd.DataFrame(columns=REQUIRED_COLS)
             st.rerun()
 
 if __name__ == "__main__":
