@@ -6,14 +6,14 @@ import re
 import os
 from datetime import datetime, timedelta
 
-# --- 1. 頁面配置 ---
-st.set_page_config(page_title="處置監控系統", layout="wide", page_icon="⚖️")
+# --- 1. 頁面基礎配置 ---
+st.set_page_config(page_title="處置監控系統 V9", layout="wide", page_icon="⚖️")
 JAIL_FILE = "jail_list.csv"
 
-# --- 2. 核心功能：深度解析國票處置區塊 ---
-def fetch_all_disposal_data():
+# --- 2. 核心功能：強化版處置資料抓取 ---
+def fetch_enhanced_disposal_data():
     """
-    抓取國票證券紅框區塊內的所有資料
+    強化版爬蟲：掃描紅框內所有資料列，確保不遺漏任何一檔處置股
     """
     url = "https://www.ibfs.com.tw/stock3/measuringstock.aspx?xy=6&xt=1"
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -23,43 +23,56 @@ def fetch_all_disposal_data():
         response.encoding = 'utf-8'
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 尋找目標表格 (紅框範圍)
-        table = soup.find('table') 
-        if not table:
-            return pd.DataFrame()
-
-        rows = table.find_all('tr')
+        # 抓取所有資料行
+        all_rows = soup.find_all('tr')
         results = []
         today_str = datetime.now().strftime("%Y-%m-%d")
 
-        for row in rows:
-            cols = row.find_all('td')
-            # 國票處置表通常每列有 6 個欄位 
-            if len(cols) >= 6:
-                # a. 股票名稱及代號 (欄位 1)
-                raw_name_code = cols[1].get_text(strip=True)
-                # 分離名稱與代號，格式通常為：新盛力(4931) 
-                code_match = re.search(r'\((\d{4,6})\)', raw_name_code)
-                code = code_match.group(1) if code_match else ""
-                name = raw_name_code.split('(')[0].strip()
+        for row in all_rows:
+            # 取得該行所有單元格文字
+            cells = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
+            
+            # 根據來源圖示，有效的處置資料行通常包含 6 個欄位以上 
+            if len(cells) >= 6:
+                # 判定是否為標題列 (跳過含有 '公告日期' 的行)
+                if "公告日期" in cells[0]:
+                    continue
+                
+                # a. 股票名稱及代號 (欄位 1) 
+                name_code_raw = cells[1]
+                # 使用正則提取括號內的數字代號
+                code_match = re.search(r'\((\d{4,6})\)', name_code_raw)
+                if not code_match: continue # 若無代號則視為無效行
+                
+                code = code_match.group(1)
+                name = name_code_raw.split('(')[0].strip()
                 
                 # b. 撮合方式 (欄位 2) 
-                # 抓取 5 或 20
-                match_mode = "".join(filter(str.isdigit, cols[2].get_text(strip=True)))
+                # 提取 5 或 20
+                match_mode = "".join(filter(str.isdigit, cells[2]))
                 
-                # c. 解析日期與計算出關時間 (欄位 5：處置內容) 
-                content_text = cols[5].get_text(strip=True)
-                # 尋找格式如：2025-12-24 ~ 2026-01-08 
-                dates = re.findall(r'(\d{4}-\d{2}-\d{2})', content_text)
+                # c. 出關時間解析 (欄位 5：處置內容) [cite: 6, 15]
+                content = cells[5]
+                # 抓取所有日期格式 YYYY-MM-DD
+                dates = re.findall(r'(\d{4}-\d{2}-\d{2})', content)
                 
+                # 若處置內容無 ISO 格式，嘗試抓取民國格式
+                if not dates:
+                    tw_match = re.search(r'至(\d{3})年(\d{1,2})月(\d{1,2})日', content)
+                    if tw_match:
+                        y = int(tw_match.group(1)) + 1911
+                        m = int(tw_match.group(2))
+                        d = int(tw_match.group(3))
+                        dates = [None, f"{y}-{m:02d}-{d:02d}"]
+
                 if len(dates) >= 2:
-                    # 結束日期為第二個日期 
-                    end_date_str = dates[1]
+                    # 結束日為區間的最後一個日期 [cite: 12, 14]
+                    end_date_str = dates[-1]
                     end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
                     # 規則：處置結束時間的隔天才算出關
                     release_date = (end_date + timedelta(days=1)).strftime("%Y-%m-%d")
                     
-                    # 3. 剔除功能：如果出關時間已到，則不顯示
+                    # 3. 剔除規則：若已過出關日則不存入
                     if release_date > today_str:
                         results.append({
                             "股票名稱及代號": f"{name} ({code})",
@@ -68,51 +81,50 @@ def fetch_all_disposal_data():
                             "出關時間": release_date
                         })
         
-        return pd.DataFrame(results)
+        return pd.DataFrame(results).drop_duplicates(subset=['代號'])
     except Exception as e:
-        st.error(f"解析網頁失敗: {e}")
+        st.error(f"數據抓取失敗: {e}")
         return pd.DataFrame()
 
-# --- 3. 資料庫管理 (每日自動同步) ---
-def sync_jail_db():
+# --- 3. 資料庫管理與同步 ---
+def sync_data():
     """
-    每日同步：讀取網頁最新資料，並更新本地 CSV 
+    執行同步：讀取網頁最新狀態並覆蓋本地資料庫
     """
-    web_df = fetch_all_disposal_data()
-    if not web_df.empty:
-        # 直接以網頁最新的清單為準 (實現新進榜自動增加，過期自動剔除)
-        # 排序：離出關日最近的排前面
-        web_df = web_df.sort_values(by="出關時間")
-        web_df.to_csv(JAIL_FILE, index=False, encoding='utf-8-sig')
-        return web_df
+    new_df = fetch_enhanced_disposal_data()
+    if not new_df.empty:
+        # 以出關日期排序
+        new_df = new_df.sort_values(by="出關時間")
+        new_df.to_csv(JAIL_FILE, index=False, encoding='utf-8-sig')
+        return new_df
     return pd.DataFrame()
 
-# --- 4. 主程式介面 ---
+# --- 4. 介面呈現 ---
 def main():
-    st.title("⚖️ 處置中")
-    st.caption(f"數據同步來源：國票證券處置公告區 | 今日日期：{datetime.now().strftime('%Y-%m-%d')}")
+    st.title("⚖️ 處置中標的監控")
+    st.caption(f"即時同步國票證券公告資料 | 今日：{datetime.now().strftime('%Y-%m-%d')}")
 
-    # 控制按鈕
-    if st.button("🔄 同步國票清單", type="primary"):
-        with st.spinner("正在解析紅框區域內所有處置標的..."):
-            df = sync_jail_db()
+    # 同步按鈕
+    if st.button("🔄 同步國票清單 (全面掃描)", type="primary"):
+        with st.spinner("正在進行全網頁深度掃描..."):
+            df = sync_data()
             if not df.empty:
-                st.success(f"同步成功！共抓取到 {len(df)} 筆處置中標的。")
+                st.success(f"同步完成！共成功抓取 {len(df)} 檔處置標的。")
+            else:
+                st.warning("目前網頁似乎無新的處置資料。")
             st.rerun()
 
-    # 讀取並顯示
+    # 顯示區
     if os.path.exists(JAIL_FILE):
         df = pd.read_csv(JAIL_FILE)
-        
         if not df.empty:
-            # 顯示統計指標
+            # 統計資訊
             c1, c2, c3 = st.columns(3)
             c1.metric("總處置檔數", f"{len(df)} 檔")
             c2.metric("20分鐘 (Level 2)", f"{len(df[df['撮合方式'].str.contains('20')])} 檔")
             c3.metric("5分鐘 (Level 1)", f"{len(df[df['撮合方式'].str.contains('5')])} 檔")
 
             st.markdown("---")
-            # 呈現表格
             st.dataframe(
                 df[["股票名稱及代號", "撮合方式", "出關時間"]],
                 use_container_width=True,
@@ -123,16 +135,16 @@ def main():
                 }
             )
         else:
-            st.info("目前無處置標的資料。")
+            st.info("清單目前為空，請點擊同步按鈕。")
     else:
-        st.info("請點擊同步按鈕開始追蹤。")
+        st.info("尚未建立資料庫，請點擊上方按鈕執行第一次同步。")
 
     st.divider()
-    with st.expander("📝 處置數據解析規則"):
-        st.write("1. **範圍**：完整掃描國票證券處置頁面之紅框區塊 。")
-        st.write("2. **撮合**：自動區分 5 分鐘(第一次處置)與 20 分鐘(第二次/加重處置)。")
-        st.write("3. **出關**：解析公告內容之結束日期，並自動 +1 天作為出關時間。")
-        st.write("4. **維護**：點擊同步後，系統會自動比對最新公告，新進榜會增加，過期標的會自動剔除。")
+    with st.expander("🛠️ 強化版技術說明"):
+        st.write("1. **全行掃描**：跳過巢狀表格限制，直接掃描頁面所有 TR 標籤，確保紅框內每一行都被讀取 。")
+        st.write("2. **多重日期解析**：支援 ISO (2025-12-24) 與 民國 (114年) 雙格式解析 [cite: 6, 8]。")
+        st.write("3. **出關日邏輯**：嚴格執行結束日期 + 1 天。")
+        st.write("4. **自動維護**：新進榜自動加入，已過出關時間標的於同步時自動剔除。")
 
 if __name__ == "__main__":
     main()
