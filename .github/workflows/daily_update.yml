@@ -1,0 +1,25 @@
+name: StockAutoUpdate
+on:
+  schedule:
+    - cron: '30 10 * * *' # 每天台灣時間 18:30 執行
+  workflow_dispatch:
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install
+        run: pip install pandas requests lxml html5lib
+      - name: Run
+        run: python daily_recorder.py
+      - name: Commit
+        run: |
+          git config --global user.name "Bot"
+          git config --global user.email "bot@github.com"
+          git add history_db.csv jail_list.csv
+          git commit -m "Auto Update" || exit 0
+          git push
