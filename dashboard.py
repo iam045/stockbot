@@ -16,7 +16,6 @@ def get_weekday_cn(date_str):
     try:
         dt = datetime.strptime(str(date_str), "%Y-%m-%d")
         weekdays = ["一", "二", "三", "四", "五", "六", "日"]
-        # 格式化為 MM/DD(週)
         return f"{dt.month}/{dt.day}({weekdays[dt.weekday()]})"
     except:
         return str(date_str)
@@ -134,13 +133,20 @@ def main():
 
     db = st.session_state.jail_db
     if not db.empty:
-        # 數據預處理
         db_display = db.copy()
-        # 轉換格式為 12/24(三)
         db_display["🔓 出關日期"] = db_display["出關時間"].apply(get_weekday_cn)
         db_display["🚨 白話解讀"] = db_display.apply(translate_to_human, axis=1)
-        # 排序仍依照原始 YYYY-MM-DD 確保跨年正確
         db_sorted = db_display.sort_values(by="出關時間")
+
+        # --- 欄位置中配置 ---
+        # 為所有欄位建立置中對齊的設定
+        center_config = {
+            "股票名稱及代號": st.column_config.TextColumn("證券標的", alignment="center"),
+            "撮合方式": st.column_config.TextColumn("撮合方式", alignment="center"),
+            "🔓 出關日期": st.column_config.TextColumn("🔓 出關日期", alignment="center"),
+            "🚨 白話解讀": st.column_config.TextColumn("🚨 白話解讀", alignment="center"),
+            "處置原因": st.column_config.TextColumn("處置原因", alignment="center")
+        }
 
         # --- 分欄顯示 ---
         st.markdown("---")
@@ -148,17 +154,32 @@ def main():
         with col_left:
             st.subheader("⏳ 5分鐘撮合")
             df_5 = db_sorted[db_sorted['撮合方式'].str.contains('5')]
-            st.dataframe(df_5[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
+            st.dataframe(
+                df_5[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], 
+                hide_index=True, 
+                use_container_width=True,
+                column_config=center_config
+            )
 
         with col_right:
             st.subheader("🚨 20分鐘撮合")
             df_20 = db_sorted[db_sorted['撮合方式'].str.contains('20')]
-            st.dataframe(df_20[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
+            st.dataframe(
+                df_20[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], 
+                hide_index=True, 
+                use_container_width=True,
+                column_config=center_config
+            )
 
         # --- 完整 Data 展示 ---
         st.markdown("---")
         st.subheader("📋 完整監控清單")
-        st.dataframe(db_sorted[["股票名稱及代號", "撮合方式", "🔓 出關日期", "處置原因"]], use_container_width=True, hide_index=True)
+        st.dataframe(
+            db_sorted[["股票名稱及代號", "撮合方式", "🔓 出關日期", "處置原因"]], 
+            use_container_width=True, 
+            hide_index=True,
+            column_config=center_config
+        )
     else:
         st.info("資料庫目前為空。")
 
