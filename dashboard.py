@@ -8,10 +8,9 @@ from datetime import datetime, timedelta
 # --- 1. 頁面基礎配置 ---
 st.set_page_config(page_title="處置監控中心", layout="wide", page_icon="⚖️")
 JAIL_FILE = "jail_list.csv"
-# 標準化欄位定義，避免格式跑掉
 REQUIRED_COLS = ["股票名稱及代號", "代號", "撮合方式", "出關時間", "處置原因"]
 
-# --- 2. 工具函式：日期與白話解讀 ---
+# --- 2. 工具函式 ---
 def get_weekday_cn(date_str):
     """將日期字串轉為極簡格式：12/24(三)"""
     try:
@@ -26,7 +25,6 @@ def convert_minguo_to_date(date_str):
     try:
         clean_str = str(date_str).strip().replace(" ", "")
         y, m, d = map(int, clean_str.split('/'))
-        # 規則：處置結束時間的隔天才算出關
         return datetime(y + 1911, m, d) + timedelta(days=1)
     except:
         return None
@@ -43,7 +41,6 @@ def translate_to_human(row):
     reason = str(row.get('處置原因', ''))
     mode = str(row.get('撮合方式', ''))
     notes = []
-    # 針對當沖與重刑犯的白話註解
     if "沖銷" in reason:
         notes.append("🚫當沖加關")
     if "20" in mode:
@@ -58,14 +55,13 @@ def process_official_csv(uploaded_file):
     try:
         raw_bytes = uploaded_file.read()
         try:
-            content = raw_bytes.decode('cp950') # 台灣官方 CSV 常用編碼
+            content = raw_bytes.decode('cp950') # 繁體常用編碼
         except UnicodeDecodeError:
             content = raw_bytes.decode('utf-8-sig')
             
         lines = content.splitlines()
         if not lines: return []
 
-        # 判定上市或上櫃格式
         if "公布處置有價證券資訊" in lines[0]:
             df = pd.read_csv(io.StringIO("\n".join(lines[1:])))
             time_col, reason_col = '處置起迄時間', '處置條件'
@@ -84,25 +80,20 @@ def process_official_csv(uploaded_file):
                 measure_content = str(row.get('處置內容', ''))
                 reason = str(row.get(reason_col, '')) if reason_col else ""
                 period = str(row.get(time_col, ''))
-                
                 if not code or '~' not in period: continue
-
-                # 提取結束日期並計算出關日 (結束日+1)
-                end_date_str = period.split('~')[1]
-                release_obj = convert_minguo_to_date(end_date_str)
-                
+                end_date_part = period.split('~')[1]
+                release_obj = convert_minguo_to_date(end_date_part)
                 if release_obj and release_obj > today:
                     results.append({
                         "股票名稱及代號": f"{name} ({code})",
-                        "代號": code,
+                        "代號": str(code),
                         "撮合方式": f"{extract_match_mode(measure_content)} 分鐘",
                         "出關時間": release_obj.strftime("%Y-%m-%d"),
                         "處置原因": reason
                     })
-            except:
-                continue
+            except: continue
     except Exception as e:
-        st.error(f"解析檔案失敗：{e}")
+        st.error(f"解析失敗：{e}")
     return results
 
 # --- 4. 資料庫維護 ---
@@ -110,11 +101,8 @@ def load_db():
     if os.path.exists(JAIL_FILE):
         try:
             df = pd.read_csv(JAIL_FILE, encoding='utf-8-sig').astype(str)
-            # 強制檢查欄位，缺少則補齊避免 KeyError
             for col in REQUIRED_COLS:
-                if col not in df.columns:
-                    df[col] = ""
-            # 自動過期剔除
+                if col not in df.columns: df[col] = ""
             today_str = datetime.now().strftime("%Y-%m-%d")
             return df[df["出關時間"] > today_str]
         except:
@@ -132,64 +120,77 @@ def main():
     
     if 'jail_db' not in st.session_state:
         st.session_state.jail_db = load_db()
+    
+    if 'new_stocks' not in st.session_state:
+        st.session_state.new_stocks = pd.DataFrame(columns=REQUIRED_COLS)
 
     # --- A. 數據更新區塊 ---
     with st.expander("📥 數據更新 (上傳官方 CSV)"):
-        uploaded_files = st.file_uploader("選擇 punish.csv 或 disposal.csv", type="csv", accept_multiple_files=True, label_visibility="collapsed")
+        uploaded_files = st.file_uploader("上傳 CSV", type="csv", accept_multiple_files=True, label_visibility="collapsed")
         if uploaded_files:
             if st.button("執行匯入", use_container_width=True):
-                all_new_data = []
+                all_new_data_list = []
                 for f in uploaded_files:
                     f.seek(0)
-                    all_new_data.extend(process_official_csv(f))
-                if all_new_data:
-                    new_df = pd.DataFrame(all_new_data)
-                    combined = pd.concat([st.session_state.jail_db, new_df])
+                    all_new_data_list.extend(process_official_csv(f))
+                
+                if all_new_data_list:
+                    new_upload_df = pd.DataFrame(all_new_data_list)
+                    
+                    # 邏輯：比對找出「新入選」的標的
+                    existing_codes = set(st.session_state.jail_db['代號'].tolist())
+                    new_entries = new_upload_df[~new_upload_df['代號'].isin(existing_codes)]
+                    st.session_state.new_stocks = new_entries
+                    
+                    # 更新總資料庫
+                    combined = pd.concat([st.session_state.jail_db, new_upload_df])
                     save_db(combined)
                     st.session_state.jail_db = load_db()
-                    st.success("已更新資料庫")
+                    st.success(f"更新成功！偵測到 {len(new_entries)} 筆新進處置標的。")
                     st.rerun()
 
     db = st.session_state.jail_db
     if not db.empty:
-        # 1. 預先處理顯示資料
-        db_display = db.copy()
-        db_display["🔓 出關日期"] = db_display["出關時間"].apply(get_weekday_cn)
-        db_display["🚨 白話解讀"] = db_display.apply(translate_to_human, axis=1)
-        db_sorted = db_display.sort_values(by="出關時間")
+        # 預處理顯示欄位
+        def prepare_display(df):
+            if df.empty: return df
+            d = df.copy()
+            d["🔓 出關日期"] = d["出關時間"].apply(get_weekday_cn)
+            d["🚨 白話解讀"] = d.apply(translate_to_human, axis=1)
+            return d.sort_values(by="出關時間")
 
-        # --- B. 左右分欄顯示 (恢復表格顯示) ---
+        db_sorted = prepare_display(db)
+        new_sorted = prepare_display(st.session_state.new_stocks)
+
+        # --- B. 新增：明日進處置區塊 ---
+        st.markdown("---")
+        col_new_l, col_new_r = st.columns(2)
+        with col_new_l:
+            st.markdown("### 🆕 明日進處置")
+            if not new_sorted.empty:
+                st.dataframe(new_sorted[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
+            else:
+                st.write("目前無新入選標的")
+        with col_new_r:
+            st.write("") # 右邊留空
+
+        # --- C. 5分鐘 vs 20分鐘看板 ---
         st.markdown("---")
         col_5, col_20 = st.columns(2)
-        
         with col_5:
             st.subheader("⏳ 5分鐘撮合")
             df_5 = db_sorted[db_sorted['撮合方式'].str.contains('5')]
-            if not df_5.empty:
-                # 簡化欄位呈現，移除 alignment 參數以相容舊版 Streamlit
-                st.dataframe(df_5[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
-            else:
-                st.write("目前無 5 分鐘處置標的")
+            st.dataframe(df_5[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
 
         with col_20:
             st.subheader("🚨 20分鐘撮合")
             df_20 = db_sorted[db_sorted['撮合方式'].str.contains('20')]
-            if not df_20.empty:
-                st.dataframe(df_20[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
-            else:
-                st.write("目前無 20 分鐘處置標的")
+            st.dataframe(df_20[["股票名稱及代號", "🔓 出關日期", "🚨 白話解讀"]], hide_index=True, use_container_width=True)
 
-        # --- C. 完整 Data 展示 ---
+        # --- D. 完整詳細清單 ---
         st.markdown("---")
         st.subheader("📋 完整監控清單")
-        st.dataframe(
-            db_sorted[["股票名稱及代號", "撮合方式", "🔓 出關日期", "處置原因"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "🔓 出關日期": st.column_config.TextColumn("🔓 出關 (12/24(三))")
-            }
-        )
+        st.dataframe(db_sorted[["股票名稱及代號", "撮合方式", "🔓 出關日期", "處置原因"]], use_container_width=True, hide_index=True)
     else:
         st.info("資料庫目前為空。")
 
@@ -198,6 +199,7 @@ def main():
         if st.button("🗑️ 清空資料庫"):
             if os.path.exists(JAIL_FILE): os.remove(JAIL_FILE)
             st.session_state.jail_db = pd.DataFrame(columns=REQUIRED_COLS)
+            st.session_state.new_stocks = pd.DataFrame(columns=REQUIRED_COLS)
             st.rerun()
 
 if __name__ == "__main__":
